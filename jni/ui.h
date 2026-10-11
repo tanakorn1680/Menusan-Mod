@@ -49,8 +49,8 @@ static const Veh kVeh[] = {
 };
 static const int kNumVeh = (int)(sizeof(kVeh) / sizeof(kVeh[0]));
 
-enum { kTabPlayer = 0, kTabVehicle, kTabTeleport, kTabGame, kTabCheats, kTabMenu, kTabCount };
-static const char* kTabs[] = {"Player", "Vehicle", "Teleport", "Game", "Cheats", "Menu"};
+enum { kTabPlayer = 0, kTabVehicle, kTabWeapon, kTabTeleport, kTabVisual, kTabGame, kTabCheats, kTabMenu, kTabCount };
+static const char* kTabs[] = {"Player", "Vehicle", "Weapon", "Teleport", "Visual", "Game", "Cheats", "Menu"};
 
 // ============================================================== game access
 typedef void (*CheatFn)();
@@ -80,6 +80,28 @@ static void (*g_loadScene)(const Vec3*) = nullptr;                  // CStreamin
 static void (*g_loadModels)(bool) = nullptr;                        // CStreaming::LoadAllRequestedModels
 static bool (*g_waterNoWaves)(float, float, float, float*, float*, float*) = nullptr;   // CWaterLevel::GetWaterLevelNoWaves
 static char** g_pRadarTrace = nullptr;                              // CRadar::ms_RadarTrace (pointer to the trace array)
+// weapons
+static int (*g_giveWeapon)(void*, int, unsigned int, bool) = nullptr;   // CPed::GiveWeapon(type, ammo, bool)
+static void (*g_setCurWeapon)(void*, int) = nullptr;                    // CPed::SetCurrentWeapon(type)
+static void (*g_clearWeapons)(void*) = nullptr;                         // CPed::ClearWeapons
+static void* (*g_getWeaponInfo)(int, signed char) = nullptr;            // CWeaponInfo::GetWeaponInfo(type, skill)
+static void (*g_requestModel)(int, int) = nullptr;                      // CStreaming::RequestModel(model, flags)
+// visual switches: single-byte game flags, read and written directly like the original menu does
+struct VisDef { const char* label; const char* sym; bool invert; int group; };
+static const VisDef kVis[] = {
+    {"Infrared Vision",  "_ZN12CPostEffects17m_bInfraredVisionE",   false, 0},
+    {"Night Vision",     "_ZN12CPostEffects14m_bNightVisionE",      false, 0},
+    {"Darkness Filter",  "_ZN12CPostEffects17m_bDarknessFilterE",   false, 0},
+    {"Video Cam Effect", "_ZN10CSpecialFX9bVideoCamE",              false, 0},
+    {"Lift Cam Effect",  "_ZN10CSpecialFX8bLiftCamE",               false, 0},
+    {"Fog Effect",       "_ZN12CPostEffects6m_bFogE",               false, 1},
+    {"Show HUD",         "_ZN11CTheScripts11bDisplayHudE",          false, 2},
+    {"Show Radar",       "_ZN4CHud23bScriptDontDisplayRadarE",      true,  2},   // the game flag means "hide"
+    {"Grey Radar",       "_ZN11CTheScripts18bPlayerIsOffTheMapE",   false, 2},
+};
+static const int kNumVis = (int)(sizeof(kVis) / sizeof(kVis[0]));
+static unsigned char* g_visPtr[16];
+static unsigned char g_visCache[16];               // last value read (refreshed 4 times a second)
 static float* g_pTimeScale = nullptr;               // CTimer::ms_fTimeScale
 static unsigned char* g_pClockH = nullptr;          // CClock::ms_nGameClockHours
 static unsigned char* g_pClockM = nullptr;          // CClock::ms_nGameClockMinutes
@@ -127,6 +149,12 @@ static int ResolveGame(uintptr_t (*lookup)(const char*)) {
     Res(lookup, g_loadModels, "_ZN10CStreaming22LoadAllRequestedModelsEb", found);
     Res(lookup, g_waterNoWaves, "_ZN11CWaterLevel20GetWaterLevelNoWavesEfffPfS0_S0_", found);
     Res(lookup, g_pRadarTrace, "_ZN6CRadar13ms_RadarTraceE", found);
+    Res(lookup, g_giveWeapon, "_ZN4CPed10GiveWeaponE11eWeaponTypejb", found);
+    Res(lookup, g_setCurWeapon, "_ZN4CPed16SetCurrentWeaponE11eWeaponType", found);
+    Res(lookup, g_clearWeapons, "_ZN4CPed12ClearWeaponsEv", found);
+    Res(lookup, g_getWeaponInfo, "_ZN11CWeaponInfo13GetWeaponInfoE11eWeaponTypea", found);
+    Res(lookup, g_requestModel, "_ZN10CStreaming12RequestModelEii", found);
+    for (int i = 0; i < kNumVis; i++) { g_symTotal++; g_visPtr[i] = (unsigned char*)lookup(kVis[i].sym); if (g_visPtr[i]) found++; }
     Res(lookup, g_pTimeScale, "_ZN6CTimer13ms_fTimeScaleE", found);
     Res(lookup, g_pClockH, "_ZN6CClock18ms_nGameClockHoursE", found);
     Res(lookup, g_pClockM, "_ZN6CClock20ms_nGameClockMinutesE", found);
@@ -367,9 +395,33 @@ static void DoTeleport(float x, float y) {
     busy = false;
 }
 
+// ============================================================== weapons
+// Same recipe as the game's own weapon cheats: load the weapon's model(s) first, then give it and equip it.
+static void DoGiveWeapon(int type, unsigned int ammo) {
+    char* ped = PlayerPed();
+    if (!ped || !g_giveWeapon || type < 1 || type > 46) return;
+    if (g_pedAlive && !g_pedAlive(ped)) return;
+    Diag::Crumb("give weapon %d x%u", type, ammo);
+    int m1 = 0, m2 = 0;
+    if (g_getWeaponInfo) {
+        char* wi = (char*)g_getWeaponInfo(type, 1);
+        if (wi) { SafeMem::Get(wi, 0xC, m1); SafeMem::Get(wi, 0x10, m2); }     // CWeaponInfo::m_nModelId / m_nModelId2
+    }
+    if (g_requestModel && g_loadModels) {
+        if (m1 > 0 && m1 < 20000) g_requestModel(m1, 0x10);                     // 0x10 = priority request, as the original menu uses
+        if (m2 > 0 && m2 < 20000) g_requestModel(m2, 0x10);
+        Diag::Crumb("  load weapon models");
+        g_loadModels(false);
+    }
+    Diag::Crumb("  give");
+    g_giveWeapon(ped, type, ammo, true);
+    if (g_setCurWeapon) g_setCurWeapon(ped, type);
+    Diag::Crumb("  done");
+}
+
 // ============================================================ action queue
 // The UI never touches the game directly; it queues actions that run inside the game's update tick.
-enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney, aTimeScale, aClockHM, aDay, aDayLen, aWeather, aTopDown, aTopZoom, aTeleport };
+enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney, aTimeScale, aClockHM, aDay, aDayLen, aWeather, aTopDown, aTopZoom, aTeleport, aGiveWeapon, aClearWeapons, aFlag };
 struct Act { int kind; int i; float f; float g; };
 static const int kQueueSize = 32;
 static Act g_queue[kQueueSize];
@@ -450,6 +502,9 @@ static void RunQueued(bool gameIsRunning) {
                 break;
             case aTopDown: if (g_pTopEnable) *g_pTopEnable = (a.i != 0); break;
             case aTopZoom: if (g_pTopZoom) *g_pTopZoom = (int)Clamp(a.f, 20.f, 60.f); break;
+            case aGiveWeapon: DoGiveWeapon(a.i, (unsigned int)a.f); break;
+            case aClearWeapons: { char* ped = PlayerPed(); if (ped && g_clearWeapons) g_clearWeapons(ped); break; }
+            case aFlag: if (a.i >= 0 && a.i < kNumVis && g_visPtr[a.i]) *g_visPtr[a.i] = (a.f != 0.f) ? 1 : 0; break;
             case aTeleport:
                 DoTeleport(a.f, a.g);
                 __atomic_store_n(&g_tpPending, 0, __ATOMIC_RELEASE);
@@ -694,6 +749,23 @@ static const TrPair kTr[] = {
     {"Top left", "บนซ้าย"}, {"Top center", "บนกลาง"}, {"Top right", "บนขวา"}, {"Bottom left", "ล่างซ้าย"}, {"Bottom right", "ล่างขวา"},
     {"Text color", "สีตัวอักษร"}, {"White", "ขาว"}, {"Yellow", "เหลือง"}, {"Green", "เขียว"}, {"Cyan", "ฟ้า"}, {"Pink", "ชมพู"}, {"Orange", "ส้ม"},
     {"Playtime", "เวลาเล่น"},
+    {"Weapon", "อาวุธ"}, {"Visual", "ภาพ"}, {"Ammo", "กระสุน"}, {"Remove all weapons", "ถอดอาวุธทั้งหมด"}, {"Weapon given", "ให้อาวุธแล้ว"},
+    {"Melee", "อาวุธระยะประชิด"}, {"Handguns", "ปืนพก"}, {"Shotguns", "ปืนลูกซอง"}, {"Submachine guns", "ปืนกลมือ"}, {"Rifles", "ปืนยาว"},
+    {"Heavy weapons", "อาวุธหนัก"}, {"Thrown", "อาวุธขว้าง"}, {"Gear", "อุปกรณ์"},
+    {"Brass knuckles", "สนับมือ"}, {"Golf club", "ไม้กอล์ฟ"}, {"Nightstick", "กระบองตำรวจ"}, {"Knife", "มีด"}, {"Baseball bat", "ไม้เบสบอล"},
+    {"Shovel", "พลั่ว"}, {"Pool cue", "ไม้พูล"}, {"Katana", "ดาบคาตานะ"}, {"Chainsaw", "เลื่อยโซ่ยนต์"}, {"Flowers", "ช่อดอกไม้"}, {"Cane", "ไม้เท้า"},
+    {"Pistol", "ปืนพก 9 มม."}, {"Silenced pistol", "ปืนพกเก็บเสียง"}, {"Desert Eagle", "เดเซิร์ตอีเกิล"},
+    {"Shotgun", "ลูกซอง"}, {"Sawn-off shotgun", "ลูกซองสั้น"}, {"Combat shotgun", "ลูกซองต่อสู้"},
+    {"Micro Uzi", "ไมโครอูซี"}, {"MP5", "MP5"}, {"Tec-9", "Tec-9"},
+    {"AK-47", "AK-47"}, {"M4", "M4"}, {"Country rifle", "ปืนไรเฟิลล่าสัตว์"}, {"Sniper rifle", "ปืนสไนเปอร์"},
+    {"RPG", "RPG"}, {"Heat-seeking RPG", "RPG นำวิถี"}, {"Flamethrower", "เครื่องพ่นไฟ"}, {"Minigun", "มินิกัน"},
+    {"Grenade", "ระเบิดมือ"}, {"Tear gas", "แก๊สน้ำตา"}, {"Molotov cocktail", "ระเบิดขวด"}, {"Satchel charge", "ระเบิดกระเป๋า"}, {"Detonator", "ตัวจุดระเบิด"},
+    {"Spray can", "สเปรย์พ่นสี"}, {"Fire extinguisher", "ถังดับเพลิง"}, {"Camera", "กล้องถ่ายรูป"}, {"Night-vision goggles", "แว่นมองกลางคืน"},
+    {"Thermal goggles", "แว่นมองความร้อน"}, {"Parachute", "ร่มชูชีพ"},
+    {"Vision filters", "ฟิลเตอร์ภาพ"}, {"HUD", "ส่วนแสดงผล (HUD)"}, {"World", "โลก"},
+    {"Infrared Vision", "มองเห็นอินฟราเรด"}, {"Night Vision", "มองเห็นกลางคืน"}, {"Darkness Filter", "ฟิลเตอร์ความมืด"},
+    {"Video Cam Effect", "เอฟเฟกต์กล้องวิดีโอ"}, {"Lift Cam Effect", "เอฟเฟกต์กล้องลิฟต์"}, {"Fog Effect", "เอฟเฟกต์หมอก"},
+    {"Show HUD", "แสดง HUD"}, {"Show Radar", "แสดงเรดาร์"}, {"Grey Radar", "เรดาร์สีเทา"},
     {"Teleport", "วาร์ป"}, {"Waypoint", "จุดหมายบนแผนที่"}, {"Waypoint set", "ปักจุดหมายแล้ว"},
     {"No waypoint on the map", "ยังไม่ได้ปักจุดหมายบนแผนที่"}, {"Teleport to waypoint", "วาร์ปไปจุดหมาย"},
     {"Teleport underwater", "วาร์ปลงใต้น้ำ"}, {"Teleporting...", "กำลังวาร์ป..."},
@@ -965,6 +1037,7 @@ static void DrawOverlay(float W, float H, float dt) {
 static const ImU32 kBtnCol = IM_COL32(40, 48, 68, 255);
 static const ImU32 kDangerCol = IM_COL32(86, 44, 52, 255);
 static const ImU32 kAccentCol = IM_COL32(52, 120, 246, 255);
+#define IM_COLOR_ARMED IM_COL32(190, 70, 40, 255)
 
 static void PagePlayer() {
     const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
@@ -1223,6 +1296,91 @@ static void PageTeleport() {
     ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
+struct Wpn { const char* section; const char* name; int type; };
+static const Wpn kWpn[] = {
+    {"Melee", "Brass knuckles", 1}, {"Melee", "Golf club", 2}, {"Melee", "Nightstick", 3}, {"Melee", "Knife", 4},
+    {"Melee", "Baseball bat", 5}, {"Melee", "Shovel", 6}, {"Melee", "Pool cue", 7}, {"Melee", "Katana", 8},
+    {"Melee", "Chainsaw", 9}, {"Melee", "Flowers", 14}, {"Melee", "Cane", 15},
+    {"Handguns", "Pistol", 22}, {"Handguns", "Silenced pistol", 23}, {"Handguns", "Desert Eagle", 24},
+    {"Shotguns", "Shotgun", 25}, {"Shotguns", "Sawn-off shotgun", 26}, {"Shotguns", "Combat shotgun", 27},
+    {"Submachine guns", "Micro Uzi", 28}, {"Submachine guns", "MP5", 29}, {"Submachine guns", "Tec-9", 32},
+    {"Rifles", "AK-47", 30}, {"Rifles", "M4", 31}, {"Rifles", "Country rifle", 33}, {"Rifles", "Sniper rifle", 34},
+    {"Heavy weapons", "RPG", 35}, {"Heavy weapons", "Heat-seeking RPG", 36}, {"Heavy weapons", "Flamethrower", 37}, {"Heavy weapons", "Minigun", 38},
+    {"Thrown", "Grenade", 16}, {"Thrown", "Tear gas", 17}, {"Thrown", "Molotov cocktail", 18}, {"Thrown", "Satchel charge", 39}, {"Thrown", "Detonator", 40},
+    {"Gear", "Spray can", 41}, {"Gear", "Fire extinguisher", 42}, {"Gear", "Camera", 43}, {"Gear", "Night-vision goggles", 44},
+    {"Gear", "Thermal goggles", 45}, {"Gear", "Parachute", 46},
+};
+static const int kNumWpn = (int)(sizeof(kWpn) / sizeof(kWpn[0]));
+static int g_ammoSel = 1;                          // index into kAmmo
+static const unsigned int kAmmo[4] = {100, 500, 1000, 9999};
+static float g_clearArmT = 0.f;                    // "remove all" waits for a second tap
+
+static void PageWeapon() {
+    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
+    const bool run = g_canRun && g_giveWeapon != nullptr;
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "%s", Tr("Ammo"));
+    { static const char* const am[4] = {"100", "500", "1000", "9999"}; const int k = ChipRow(am, 4, 1200, g_ammoSel, true); if (k >= 0) g_ammoSel = k; }
+    ImGui::Spacing();
+    const bool armed = g_clearArmT > 0.f;
+    if (Btn(armed ? Tr("TAP AGAIN") : Tr("Remove all weapons"), ImVec2(RowWidth(), 96.f * sc), 1210, armed ? IM_COLOR_ARMED : kDangerCol, g_canRun && g_clearWeapons != nullptr)) {
+        if (armed) { g_clearArmT = 0.f; Enqueue(aClearWeapons, 0); Toast(Tr("Remove all weapons")); }
+        else { g_clearArmT = 2.5f; Toast(Tr("Tap again to confirm")); }
+    }
+    ImGui::Spacing();
+    const float colW = (RowWidth() - sp) * 0.5f;
+    const char* last = nullptr; int n = 0; bool open = true; int secIdx = -1;
+    for (int i = 0; i < kNumWpn; i++) {
+        const Wpn& w = kWpn[i];
+        if (!last || strcmp(last, w.section) != 0) {
+            last = w.section; secIdx++; n = 0;
+            int cnt = 0; for (int j = i; j < kNumWpn && !strcmp(kWpn[j].section, w.section); j++) cnt++;
+            open = g_expanded[44 + secIdx];
+            if (Header(Tr(w.section), cnt, 380 + secIdx, open)) g_expanded[44 + secIdx] = !g_expanded[44 + secIdx];
+        }
+        if (!open) continue;
+        if (n % 2) ImGui::SameLine();
+        if (Btn(Tr(w.name), ImVec2(colW, 96.f * sc), 1300 + i, kBtnCol, run)) {
+            if (!g_canRun) Toast(Tr("Start playing first"));
+            else { Enqueue(aGiveWeapon, w.type, (float)kAmmo[g_ammoSel]); Toast(Tr(w.name)); }
+        }
+        n++;
+    }
+    if (!g_canRun) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Start playing to edit these values"));
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
+}
+
+// raw flag value that turns a switch (currently `on`) the other way; `invert` = the game flag means "hide"
+static unsigned char VisNextRaw(bool on, bool invert) { return ((!on) != invert) ? 1 : 0; }
+
+static void RefreshVis() {
+    static double next = 0.0;
+    const double t = MonoNow();
+    if (t < next) return;
+    next = t + 0.25;
+    for (int i = 0; i < kNumVis; i++) { unsigned char b = 0; if (g_visPtr[i] && SafeMem::Get(g_visPtr[i], 0, b)) g_visCache[i] = b; }
+}
+
+static void PageVisual() {
+    const float sc = g_sc;
+    RefreshVis();
+    static const char* const kGroups[3] = {"Vision filters", "World", "HUD"};
+    for (int g = 0; g < 3; g++) {
+        if (!Section(Tr(kGroups[g]), 40 + g, 390 + g)) continue;
+        for (int i = 0; i < kNumVis; i++) {
+            if (kVis[i].group != g) continue;
+            const bool on = (g_visCache[i] != 0) != kVis[i].invert;
+            if (ToggleRow(Tr(kVis[i].label), 1100 + i, on, g_canRun && g_visPtr[i] != nullptr)) {
+                const unsigned char raw = VisNextRaw(on, kVis[i].invert);     // the flag value that flips the switch
+                Enqueue(aFlag, i, (float)raw);
+                g_visCache[i] = raw;
+            }
+        }
+        ImGui::Spacing();
+    }
+    if (!g_canRun) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Start playing to edit these values"));
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
+}
+
 static void PageCheats() {
     const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
     if (!CheatTablesOk()) {
@@ -1300,7 +1458,7 @@ static void PageMenu() {
     ImGui::Spacing();
 
     ImGui::TextColored(hdr, "%s", Tr("About"));
-    ImGui::TextColored(dim, "ProMenu 0.8");
+    ImGui::TextColored(dim, "ProMenu 0.9");
     ImGui::TextColored(dim, "Radar table: %s", g_radarLayout);
     ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/%d"), g_dbgGameState, g_dbgFound, g_symTotal);
     ImGui::TextColored(dim, Tr("Cheat tables: %s"), CheatTablesOk() ? Tr("found") : Tr("missing"));
@@ -1334,6 +1492,7 @@ static void Draw(float W, float H, float dt) {
     g_rectsBuild.clear();
     g_dbgTaps = g_dbgTaps + g_nFired;
     if (g_armedT > 0.f) { g_armedT -= dt; if (g_armedT <= 0.f) g_armedIdx = -1; }
+    if (g_clearArmT > 0.f) g_clearArmT -= dt;
     g_fps = g_fps * 0.9f + (1.f / dt) * 0.1f;
     if (g_canRun) g_playSec += dt;
 
@@ -1410,7 +1569,7 @@ static void Draw(float W, float H, float dt) {
     ImGui::Begin("##panel", nullptr, panelFlags);
 
     const float hh = 84.f * sc;                      // header height
-    const float btnH = 96.f * sc;                    // sidebar button height
+    const float btnH = 84.f * sc;                    // sidebar button height (8 tabs must fit)
     const ImU32 kAccent = IM_COL32(52, 120, 246, 255);
 
     ImGui::SetCursorPos(ImVec2(18.f * sc, (hh - ImGui::GetFontSize()) * 0.5f));
@@ -1447,7 +1606,9 @@ static void Draw(float W, float H, float dt) {
     switch (g_tab) {
         case kTabPlayer:  PagePlayer();  break;
         case kTabVehicle: PageVehicle(); break;
+        case kTabWeapon:  PageWeapon();  break;
         case kTabTeleport: PageTeleport(); break;
+        case kTabVisual:  PageVisual();  break;
         case kTabGame:    PageGame();    break;
         case kTabCheats:  PageCheats();  break;
         default:          PageMenu();    break;
