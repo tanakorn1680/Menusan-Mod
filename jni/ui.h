@@ -86,9 +86,16 @@ static void (*g_setCurWeapon)(void*, int) = nullptr;                    // CPed:
 static void (*g_clearWeapons)(void*) = nullptr;                         // CPed::ClearWeapons
 static void* (*g_getWeaponInfo)(int, signed char) = nullptr;            // CWeaponInfo::GetWeaponInfo(type, skill)
 static void (*g_clearWeapon)(void*, int) = nullptr;                     // CPed::ClearWeapon(type)
-// pickups (names follow the PC game; if the build does not export them the Drop button says so)
-static int (*g_genPickupW)(Vec3*, int, unsigned char, unsigned int, bool, char*) = nullptr;                    // CPickups::GenerateNewOne_WeaponType
-static int (*g_genPickup)(Vec3*, unsigned int, unsigned char, unsigned int, unsigned int, bool, char*) = nullptr;   // CPickups::GenerateNewOne
+// SAUtils script interface: the original menu drops weapons by running game script commands through it
+struct ScriptCmd { unsigned short opcode; char params[16]; };            // 18 bytes: opcode + parameter types (i = int, f = float, v = output)
+typedef void (*ScriptFn)(void* self, const ScriptCmd* cmd, ...);        // SAUtils::ScriptCommand(const SCRIPT_COMMAND*, ...)
+static void* g_sautils = nullptr;                                        // the "SAUtils" interface object (set by main.cpp)
+static ScriptFn g_scriptFn = nullptr;
+static int (*g_getPedRef)(void*) = nullptr;                              // CPools::GetPedRef(ped)
+static const ScriptCmd kCmdOffset = {0x04C4, "ifffvvv"};                 // GET_OFFSET_FROM_CHAR_IN_WORLD_COORDS
+static const ScriptCmd kCmdModel  = {0x0781, "iv"};                      // GET_WEAPONTYPE_MODEL
+static const ScriptCmd kCmdPickup = {0x032B, "iiifffv"};                 // CREATE_PICKUP_WITH_AMMO
+static const ScriptCmd kCmdRemove = {0x0555, "ii"};                      // REMOVE_WEAPON_FROM_CHAR
 static void (*g_requestModel)(int, int) = nullptr;                      // CStreaming::RequestModel(model, flags)
 // visual switches: single-byte game flags, read and written directly like the original menu does
 struct VisDef { const char* label; const char* sym; bool invert; int group; };
@@ -159,8 +166,7 @@ static int ResolveGame(uintptr_t (*lookup)(const char*)) {
     Res(lookup, g_getWeaponInfo, "_ZN11CWeaponInfo13GetWeaponInfoE11eWeaponTypea", found);
     Res(lookup, g_requestModel, "_ZN10CStreaming12RequestModelEii", found);
     Res(lookup, g_clearWeapon, "_ZN4CPed11ClearWeaponE11eWeaponType", found);
-    Res(lookup, g_genPickupW, "_ZN8CPickups25GenerateNewOne_WeaponTypeE7CVector11eWeaponTypehjbPc", found);
-    Res(lookup, g_genPickup, "_ZN8CPickups14GenerateNewOneE7CVectorjhjjbPc", found);
+    Res(lookup, g_getPedRef, "_ZN6CPools9GetPedRefEP4CPed", found);
     for (int i = 0; i < kNumVis; i++) { g_symTotal++; g_visPtr[i] = (unsigned char*)lookup(kVis[i].sym); if (g_visPtr[i]) found++; }
     Res(lookup, g_pTimeScale, "_ZN6CTimer13ms_fTimeScaleE", found);
     Res(lookup, g_pClockH, "_ZN6CClock18ms_nGameClockHoursE", found);
@@ -477,49 +483,52 @@ static void DoRemoveCurrent() {
     Toast(Tr("Remove current weapon"));
 }
 
-// forward direction of the player (matrix "top" vector, or the heading when there is no matrix)
-static void PlayerForward(char* ped, float* fx, float* fy) {
-    *fx = 0.f; *fy = 1.f;
-    char* m = nullptr;
-    SafeMem::Get(ped, 0x18, m);
-    float v[3] = {0.f, 0.f, 0.f};
-    if (m && SafeMem::Read(m + 0x10, v, sizeof(v))) { *fx = v[0]; *fy = v[1]; }
-    else { float h = 0.f; if (SafeMem::Get(ped, 0x14, h) && Finite(h)) { *fx = -sinf(h); *fy = cosf(h); } }
-    const float len = sqrtf(*fx * *fx + *fy * *fy);
-    if (!Finite(len) || len < 0.1f) { *fx = 0.f; *fy = 1.f; } else { *fx /= len; *fy /= len; }
+// Slot 39 of the SAUtils vtable is ScriptCommand (read from the user's libSAUtils64.so and from the original menu's call);
+// main.cpp prefers the exported symbol and only falls back to this.
+static ScriptFn ScriptFnFromVtable(void* iface) {
+    void** vt = nullptr; ScriptFn fn = nullptr;
+    if (!iface || !SafeMem::Get(iface, 0, vt) || !vt) return nullptr;
+    if (!SafeMem::Get(vt, 39 * 8, fn)) return nullptr;
+    return fn;
 }
 
-// Same four steps as the original menu (it runs them as script commands): a spot in front of the player,
-// the weapon's pickup there, then the weapon is taken from the player.  Nothing is removed unless the pickup was made.
+// Same four steps as the original menu, run as game script commands through SAUtils:
+//   1. a spot 3 units in front of the player   2. the model of the held weapon
+//   3. a pickup with the same ammo there        4. take the weapon from the player
+// The weapon is only removed when the pickup really exists.
 static void DoDropWeapon() {
     char* ped = PlayerPed();
     if (!ped) return;
     if (g_pedAlive && !g_pedAlive(ped)) return;
-    if (!g_genPickupW && !g_genPickup) { Diag::Crumb("drop: pickup function not found"); Toast(Tr("Drop is not available in this game version")); return; }
+    if (!g_scriptFn || !g_sautils || !g_getPedRef) { Diag::Crumb("drop: SAUtils script interface not available"); Toast(Tr("Drop needs the SAUtils mod")); return; }
     if (g_findPlayerVehicle && g_findPlayerVehicle(-1, true)) { Toast(Tr("Get out of the vehicle first")); return; }
     WpnSlot w[kWeaponSlots]; int active = 0;
     if (!ReadWeapons(ped, w, &active) || active < 0 || active >= kWeaponSlots) { Diag::Crumb("drop: weapon array unreadable"); return; }
     const int type = w[active].type;
-    unsigned int ammo = w[active].ammo;
+    int ammo = (int)w[active].ammo;
     if (!IsRealWeapon(type)) { Toast(Tr("You have no weapons")); return; }
-    float p[3];
-    if (!EntityPos(ped, p)) return;
-    float fx, fy;
-    PlayerForward(ped, &fx, &fy);
-    Vec3 pos = {p[0] + fx * 2.5f, p[1] + fy * 2.5f, p[2] - 0.4f};
-    if (g_groundZ) { const float gz = g_groundZ(pos.x, pos.y); if (Finite(gz) && fabsf(gz - p[2]) < 5.f) pos.z = gz + 0.5f; }
     if (ammo < 1) ammo = 1;
-    Diag::Crumb("drop weapon %d ammo %u at %.1f %.1f %.1f", type, ammo, pos.x, pos.y, pos.z);
-    bool made = false;
-    if (g_genPickupW) { Diag::Crumb("  create pickup (by weapon)"); g_genPickupW(&pos, type, 3, ammo, false, nullptr); made = true; }
-    else if (g_getWeaponInfo) {
-        int model = 0;
-        char* wi = (char*)g_getWeaponInfo(type, 1);
-        if (wi) SafeMem::Get(wi, 0xC, model);
-        if (model > 0 && model < 20000) { Diag::Crumb("  create pickup (model %d)", model); g_genPickup(&pos, (unsigned int)model, 3, ammo, 0, false, nullptr); made = true; }
-    }
-    if (!made) { Diag::Crumb("  no pickup made, weapon kept"); return; }
-    if (g_clearWeapon) { Diag::Crumb("  take weapon from player"); g_clearWeapon(ped, type); }
+    const int pedRef = g_getPedRef(ped);
+    if (pedRef <= 0) { Diag::Crumb("drop: no ped handle"); return; }
+    Diag::Crumb("drop weapon %d ammo %d (ped %d)", type, ammo, pedRef);
+
+    float x = 0.f, y = 0.f, z = 0.f;
+    Diag::Crumb("  step 1: spot in front");
+    g_scriptFn(g_sautils, &kCmdOffset, pedRef, 0.0, 3.0, 0.0, &x, &y, &z);
+    if (!Finite(x) || !Finite(y) || !Finite(z) || (x == 0.f && y == 0.f && z == 0.f)) { Diag::Crumb("  bad spot, weapon kept"); return; }
+
+    int model = 0;
+    Diag::Crumb("  step 2: weapon model");
+    g_scriptFn(g_sautils, &kCmdModel, type, &model);
+    if (model <= 0 || model >= 20000) { Diag::Crumb("  bad model %d, weapon kept", model); return; }
+
+    int handle = -1;
+    Diag::Crumb("  step 3: create pickup (model %d) at %.1f %.1f %.1f", model, x, y, z);
+    g_scriptFn(g_sautils, &kCmdPickup, model, 3, ammo, (double)x, (double)y, (double)z, &handle);
+    if (handle == -1 || handle == 0) { Diag::Crumb("  pickup failed (handle %d), weapon kept", handle); Toast(Tr("Could not drop here")); return; }
+
+    Diag::Crumb("  step 4: take weapon (pickup handle %d)", handle);
+    g_scriptFn(g_sautils, &kCmdRemove, pedRef, type);
     Diag::Crumb("  done");
     Toast(Tr("Weapon dropped"));
 }
@@ -861,7 +870,7 @@ static const TrPair kTr[] = {
     {"Text color", "สีตัวอักษร"}, {"White", "ขาว"}, {"Yellow", "เหลือง"}, {"Green", "เขียว"}, {"Cyan", "ฟ้า"}, {"Pink", "ชมพู"}, {"Orange", "ส้ม"},
     {"Playtime", "เวลาเล่น"},
     {"Drop current weapon", "ทิ้งอาวุธที่ถืออยู่"}, {"Remove current weapon", "ถอดอาวุธที่ถืออยู่"}, {"You have no weapons", "ยังไม่มีอาวุธ"},
-    {"Weapon dropped", "ทิ้งอาวุธแล้ว"}, {"Drop is not available in this game version", "เกมเวอร์ชันนี้ไม่รองรับการทิ้งอาวุธ"},
+    {"Weapon dropped", "ทิ้งอาวุธแล้ว"}, {"Drop needs the SAUtils mod", "การทิ้งอาวุธต้องใช้ม็อด SAUtils"}, {"Could not drop here", "ทิ้งตรงนี้ไม่ได้"},
     {"Get out of the vehicle first", "ลงจากรถก่อน"},
     {"Weapon", "อาวุธ"}, {"Visual", "ภาพ"}, {"Ammo", "กระสุน"}, {"Remove all weapons", "ถอดอาวุธทั้งหมด"}, {"Weapon given", "ให้อาวุธแล้ว"},
     {"Melee", "อาวุธระยะประชิด"}, {"Handguns", "ปืนพก"}, {"Shotguns", "ปืนลูกซอง"}, {"Submachine guns", "ปืนกลมือ"}, {"Rifles", "ปืนยาว"},
@@ -1435,12 +1444,12 @@ static void PageWeapon() {
     ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "%s", Tr("Ammo"));
     { static const char* const am[4] = {"100", "500", "1000", "9999"}; const int k = ChipRow(am, 4, 1200, g_ammoSel, true); if (k >= 0) g_ammoSel = k; }
     ImGui::Spacing();
-    const bool haveDrop = (g_genPickupW != nullptr || g_genPickup != nullptr);
+    const bool haveDrop = (g_scriptFn != nullptr && g_sautils != nullptr && g_getPedRef != nullptr);
     const float hw = (RowWidth() - sp) * 0.5f;
     if (Btn(Tr("Drop current weapon"), ImVec2(hw, 96.f * sc), 1211, kBtnCol, g_canRun && haveDrop)) Enqueue(aDropWeapon, 0);
     ImGui::SameLine();
     if (Btn(Tr("Remove current weapon"), ImVec2(hw, 96.f * sc), 1212, kBtnCol, g_canRun && g_clearWeapon != nullptr)) Enqueue(aRemoveCurrent, 0);
-    if (!haveDrop) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Drop is not available in this game version"));
+    if (!haveDrop) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Drop needs the SAUtils mod"));
     const bool armed = g_clearArmT > 0.f;
     if (Btn(armed ? Tr("TAP AGAIN") : Tr("Remove all weapons"), ImVec2(RowWidth(), 96.f * sc), 1210, armed ? IM_COLOR_ARMED : kDangerCol, g_canRun && (g_clearWeapon != nullptr || g_clearWeapons != nullptr))) {
         if (armed) { g_clearArmT = 0.f; Enqueue(aClearWeapons, 0); }
@@ -1578,7 +1587,7 @@ static void PageMenu() {
     ImGui::Spacing();
 
     ImGui::TextColored(hdr, "%s", Tr("About"));
-    ImGui::TextColored(dim, "ProMenu 0.9.1");
+    ImGui::TextColored(dim, "ProMenu 0.9.2");
     ImGui::TextColored(dim, "Radar table: %s", g_radarLayout);
     ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/%d"), g_dbgGameState, g_dbgFound, g_symTotal);
     ImGui::TextColored(dim, Tr("Cheat tables: %s"), CheatTablesOk() ? Tr("found") : Tr("missing"));

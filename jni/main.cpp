@@ -167,6 +167,25 @@ static bool InitImGui() {
     return true;
 }
 
+// SAUtils (the same mod the original ARM menu needs) runs game script commands for us.  It may load after us,
+// so keep looking for it until it shows up.
+static void TryAcquireSautils() {
+    if (UI::g_sautils) return;
+    static int tick = 0;
+    if ((tick++ % 90) != 0) return;
+    void* o = GetInterface("SAUtils");
+    if (!o) return;
+    UI::ScriptFn fn = nullptr;
+    void* h = aml->GetLibHandle("libSAUtils64.so");
+    if (h) fn = reinterpret_cast<UI::ScriptFn>(aml->GetSym(h, "_ZN7SAUtils13ScriptCommandEPK14SCRIPT_COMMANDz"));
+    const bool viaSymbol = fn != nullptr;
+    if (!fn) fn = UI::ScriptFnFromVtable(o);
+    if (!fn) { logger->Info("SAUtils found but ScriptCommand not resolved"); return; }
+    UI::g_scriptFn = fn;
+    UI::g_sautils = o;
+    logger->Info("SAUtils ready (ScriptCommand via %s)", viaSymbol ? "symbol" : "vtable slot 39");
+}
+
 static void Frame() {
     if (g_failed) return;
     if (!g_inited) {
@@ -175,6 +194,7 @@ static void Frame() {
         g_inited = true;
     }
 
+    TryAcquireSautils();
     const int state = *g_pGameState;
     const bool pauseMenu = g_pMobileMenu && *reinterpret_cast<const int*>(g_pMobileMenu + 0x24) != 0;
     const bool show = (state != 7) && !pauseMenu;
@@ -252,5 +272,5 @@ ON_MOD_LOAD()
     HOOKSYM(ClockUpdate,              g_hGame, kClock);
     logger->Info("loaded, hooks installed");
     Diag::KeepPreviousSession();                 // the breadcrumbs of a crashed run survive the restart
-    Diag::Crumb("ProMenu 0.9.1 loaded");
+    Diag::Crumb("ProMenu 0.9.2 loaded");
 }
