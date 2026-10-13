@@ -90,6 +90,8 @@ static void (*g_clearWeapon)(void*, int) = nullptr;                     // CPed:
 struct ScriptCmd { unsigned short opcode; char params[16]; };            // 18 bytes: opcode + parameter types (i = int, f = float, v = output)
 typedef void (*ScriptFn)(void* self, const ScriptCmd* cmd, ...);        // SAUtils::ScriptCommand(const SCRIPT_COMMAND*, ...)
 static void* g_sautils = nullptr;                                        // the "SAUtils" interface object (set by main.cpp)
+static char g_dropInfo1[120] = "", g_dropInfo2[160] = "";                // what the last drop did (shown under the buttons)
+static bool g_dropKeep = false;                                          // test mode: make the pickup but keep the weapon
 static ScriptFn g_scriptFn = nullptr;
 static int (*g_getPedRef)(void*) = nullptr;                              // CPools::GetPedRef(ped)
 static const ScriptCmd kCmdOffset = {0x04C4, "ifffvvv"};                 // GET_OFFSET_FROM_CHAR_IN_WORLD_COORDS
@@ -511,22 +513,32 @@ static void DoDropWeapon() {
     const int pedRef = g_getPedRef(ped);
     if (pedRef <= 0) { Diag::Crumb("drop: no ped handle"); return; }
     Diag::Crumb("drop weapon %d ammo %d (ped %d)", type, ammo, pedRef);
+    g_dropInfo1[0] = g_dropInfo2[0] = 0;
+    float me[3] = {0.f, 0.f, 0.f};
+    EntityPos(ped, me);
 
     float x = 0.f, y = 0.f, z = 0.f;
     Diag::Crumb("  step 1: spot in front");
     g_scriptFn(g_sautils, &kCmdOffset, pedRef, 0.0, 3.0, 0.0, &x, &y, &z);
-    if (!Finite(x) || !Finite(y) || !Finite(z) || (x == 0.f && y == 0.f && z == 0.f)) { Diag::Crumb("  bad spot, weapon kept"); return; }
+    snprintf(g_dropInfo2, sizeof(g_dropInfo2), "You %.0f %.0f %.0f   spot %.0f %.0f %.0f", me[0], me[1], me[2], x, y, z);
+    if (!Finite(x) || !Finite(y) || !Finite(z) || (x == 0.f && y == 0.f && z == 0.f)) {
+        Diag::Crumb("  bad spot, weapon kept"); snprintf(g_dropInfo1, sizeof(g_dropInfo1), "Step 1 failed: no spot in front"); return;
+    }
 
     int model = 0;
     Diag::Crumb("  step 2: weapon model");
     g_scriptFn(g_sautils, &kCmdModel, type, &model);
-    if (model <= 0 || model >= 20000) { Diag::Crumb("  bad model %d, weapon kept", model); return; }
+    if (model <= 0 || model >= 20000) {
+        Diag::Crumb("  bad model %d, weapon kept", model); snprintf(g_dropInfo1, sizeof(g_dropInfo1), "Step 2 failed: weapon %d has model %d", type, model); return;
+    }
 
     int handle = -1;
     Diag::Crumb("  step 3: create pickup (model %d) at %.1f %.1f %.1f", model, x, y, z);
     g_scriptFn(g_sautils, &kCmdPickup, model, 3, ammo, (double)x, (double)y, (double)z, &handle);
+    snprintf(g_dropInfo1, sizeof(g_dropInfo1), "Weapon %d, model %d, ammo %d, pickup handle %d", type, model, ammo, handle);
     if (handle == -1 || handle == 0) { Diag::Crumb("  pickup failed (handle %d), weapon kept", handle); Toast(Tr("Could not drop here")); return; }
 
+    if (g_dropKeep) { Diag::Crumb("  test mode: weapon kept (pickup handle %d)", handle); Toast(Tr("Pickup created (weapon kept)")); return; }
     Diag::Crumb("  step 4: take weapon (pickup handle %d)", handle);
     g_scriptFn(g_sautils, &kCmdRemove, pedRef, type);
     Diag::Crumb("  done");
@@ -870,7 +882,7 @@ static const TrPair kTr[] = {
     {"Text color", "สีตัวอักษร"}, {"White", "ขาว"}, {"Yellow", "เหลือง"}, {"Green", "เขียว"}, {"Cyan", "ฟ้า"}, {"Pink", "ชมพู"}, {"Orange", "ส้ม"},
     {"Playtime", "เวลาเล่น"},
     {"Drop current weapon", "ทิ้งอาวุธที่ถืออยู่"}, {"Remove current weapon", "ถอดอาวุธที่ถืออยู่"}, {"You have no weapons", "ยังไม่มีอาวุธ"},
-    {"Weapon dropped", "ทิ้งอาวุธแล้ว"}, {"Drop needs the SAUtils mod", "การทิ้งอาวุธต้องใช้ม็อด SAUtils"}, {"Could not drop here", "ทิ้งตรงนี้ไม่ได้"},
+    {"Weapon dropped", "ทิ้งอาวุธแล้ว"}, {"Drop needs the SAUtils mod", "การทิ้งอาวุธต้องใช้ม็อด SAUtils"}, {"Could not drop here", "ทิ้งตรงนี้ไม่ได้"}, {"Test: keep weapon when dropping", "ทดสอบ: สร้างของเก็บแต่ไม่ถอดอาวุธ"}, {"Pickup created (weapon kept)", "สร้างของเก็บแล้ว (ยังถืออาวุธอยู่)"},
     {"Get out of the vehicle first", "ลงจากรถก่อน"},
     {"Weapon", "อาวุธ"}, {"Visual", "ภาพ"}, {"Ammo", "กระสุน"}, {"Remove all weapons", "ถอดอาวุธทั้งหมด"}, {"Weapon given", "ให้อาวุธแล้ว"},
     {"Melee", "อาวุธระยะประชิด"}, {"Handguns", "ปืนพก"}, {"Shotguns", "ปืนลูกซอง"}, {"Submachine guns", "ปืนกลมือ"}, {"Rifles", "ปืนยาว"},
@@ -1450,6 +1462,8 @@ static void PageWeapon() {
     ImGui::SameLine();
     if (Btn(Tr("Remove current weapon"), ImVec2(hw, 96.f * sc), 1212, kBtnCol, g_canRun && g_clearWeapon != nullptr)) Enqueue(aRemoveCurrent, 0);
     if (!haveDrop) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Drop needs the SAUtils mod"));
+    if (ToggleRow(Tr("Test: keep weapon when dropping"), 1213, g_dropKeep, haveDrop)) g_dropKeep = !g_dropKeep;
+    if (g_dropInfo1[0]) { ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", g_dropInfo1); ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", g_dropInfo2); }
     const bool armed = g_clearArmT > 0.f;
     if (Btn(armed ? Tr("TAP AGAIN") : Tr("Remove all weapons"), ImVec2(RowWidth(), 96.f * sc), 1210, armed ? IM_COLOR_ARMED : kDangerCol, g_canRun && (g_clearWeapon != nullptr || g_clearWeapons != nullptr))) {
         if (armed) { g_clearArmT = 0.f; Enqueue(aClearWeapons, 0); }
@@ -1587,7 +1601,7 @@ static void PageMenu() {
     ImGui::Spacing();
 
     ImGui::TextColored(hdr, "%s", Tr("About"));
-    ImGui::TextColored(dim, "ProMenu 0.9.2");
+    ImGui::TextColored(dim, "ProMenu 0.9.3");
     ImGui::TextColored(dim, "Radar table: %s", g_radarLayout);
     ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/%d"), g_dbgGameState, g_dbgFound, g_symTotal);
     ImGui::TextColored(dim, Tr("Cheat tables: %s"), CheatTablesOk() ? Tr("found") : Tr("missing"));
